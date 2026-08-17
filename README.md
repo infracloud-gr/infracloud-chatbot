@@ -21,7 +21,7 @@ Hệ thống chatbot hỏi-đáp dựa trên kiến trúc **RAG (Retrieval-Augme
 | Orchestration | LangChain (LCEL - LangChain Expression Language) |
 | Vector Database | Qdrant (chạy dạng server — Docker/Qdrant Cloud, dữ liệu persistent, hỗ trợ upsert/delete theo point ID không cần rebuild toàn bộ) |
 | LLM Providers | DeepSeek API, Groq API, Qwen API (qua `langchain_deepseek`, `langchain_groq`, hoặc `ChatOpenAI`-compatible wrapper cho các API tương thích OpenAI schema) |
-| Embedding model | Có thể dùng embedding cục bộ (`sentence-transformers`) hoặc embedding API (tuỳ nhà cung cấp hỗ trợ) |
+| Embedding model | **Qwen embedding API** (dòng `Qwen3-Embedding`, qua Alibaba DashScope/Model Studio, endpoint tương thích OpenAI — dùng chung hệ sinh thái với LLM Qwen đang dùng để chat) làm lựa chọn chính nếu có key Qwen; fallback cục bộ bằng `sentence-transformers` khi cần chạy offline hoặc giảm chi phí gọi API. Lưu ý: DeepSeek và Groq hiện **không cung cấp endpoint embedding**, chỉ có API chat/completion — **nếu hệ thống chỉ dùng Groq (không có Qwen/DeepSeek), embedding bắt buộc phải chạy cục bộ bằng `sentence-transformers`**, đây không còn là fallback tuỳ chọn mà là giải pháp chính duy nhất. |
 | Backend API | FastAPI |
 | Lưu nội dung knowledge base | PostgreSQL/MySQL (bảng `categories`, `articles`) qua SQLAlchemy — nội dung bài viết ở định dạng Markdown |
 | Sinh link bài viết trong câu trả lời | `base_url` cấu hình qua biến môi trường + `slug` của `category` và `article`, ghép thành URL chi tiết bài viết |
@@ -98,6 +98,11 @@ Knowledge base được quản trị như một hệ thống blog đơn giản:
 
 ### 3.4. Embedding & Lưu Vector
 
+- **Embedding model dùng API `Qwen3-Embedding`** (qua LangChain, cấu hình `DashScopeEmbeddings` hoặc `OpenAIEmbeddings` trỏ `base_url` sang endpoint DashScope tương thích OpenAI) — tận dụng cùng provider Qwen đang dùng cho chat, giảm số lượng nhà cung cấp cần quản lý key/billing riêng.
+  - **Lưu ý quan trọng**: DeepSeek và Groq **không có API embedding**, chỉ phục vụ chat/completion, nên không thể dùng 2 provider này cho bước embedding — dù model chat vẫn có thể chọn linh hoạt giữa cả 3 (mục 4).
+  - Có thể cấu hình **fallback embedding cục bộ** bằng `sentence-transformers` (ví dụ model đa ngôn ngữ như `intfloat/multilingual-e5-base`) cho trường hợp: (a) cần chạy offline/không phụ thuộc mạng, (b) muốn tránh chi phí gọi API embedding khi ingest khối lượng lớn bài viết, hoặc (c) API Qwen embedding gặp sự cố tạm thời trong lúc reindex.
+  - **Trường hợp chỉ dùng Groq** (không có key Qwen/DeepSeek): embedding cục bộ (`sentence-transformers`) không còn là fallback mà là **lựa chọn bắt buộc duy nhất**, vì Groq không có API embedding. Toàn bộ chi phí compute embedding lúc này chuyển sang chạy trên chính server/container của bạn (CPU hoặc GPU nếu có) thay vì gọi API ngoài.
+  - Cần đảm bảo **query lúc trả lời và toàn bộ chunk lúc index dùng cùng một embedding model** (cùng dimension) — nếu đổi giữa Qwen embedding API và model cục bộ, bắt buộc phải **rebuild toàn bộ collection**, không thể trộn lẫn 2 loại vector cùng dimension khác nhau trong 1 collection.
 - Chunk được embed và ghi vào một **Qdrant collection** (chạy dạng server — self-host qua Docker hoặc Qdrant Cloud), dữ liệu được **persist thật sự** trên đĩa/volume, không mất khi service restart.
 - Mỗi lần khởi động service **không cần rebuild toàn bộ index** — chỉ cần kết nối tới Qdrant collection đã có sẵn. Việc "full ingestion" (đọc toàn bộ bài viết `published` từ DB rồi index) chỉ cần chạy **một lần đầu** khi khởi tạo collection, hoặc chạy thủ công khi cần rebuild hoàn toàn (ví dụ đổi embedding model).
 - Mỗi điểm (point) trong Qdrant dùng `point_id` xác định (ví dụ hash từ `article_id` + `chunk_index`), giúp việc upsert/xoá theo từng chunk cụ thể rất hiệu quả mà không đụng tới các point khác.
@@ -123,7 +128,7 @@ Cơ chế **debounce** (gộp các thay đổi trong ~1-2 giây) được áp d�
 ## 4. Quản Lý Nhiều LLM Qua LangChain
 
 - Mỗi provider (DeepSeek, Groq, Qwen) được khởi tạo thành một `ChatModel` riêng biệt trong LangChain (ví dụ `ChatDeepSeek`, `ChatGroq`, hoặc cấu hình `ChatOpenAI` trỏ base_url tương thích cho Qwen nếu dùng endpoint dạng OpenAI-compatible).
-- Xây dựng lớp **Model Router**:
+- Xây dựng lớp **Model Router** — áp dụng cho bước **sinh câu trả lời (chat/completion)**, không áp dụng cho embedding (embedding dùng riêng API Qwen embedding, xem mục 3.4):
   - Cấu hình model mặc định.
   - Cho phép người dùng chọn model qua tham số request (`model: "deepseek" | "groq" | "qwen"`).
   - Cơ chế **fallback**: nếu model chính lỗi (timeout, rate limit từ phía provider), tự động chuyển sang model dự phòng theo danh sách ưu tiên (dùng `RunnableWithFallbacks` của LangChain).
@@ -183,7 +188,7 @@ project/
 │   │   ├── chat.py            # Endpoint /chat
 │   │   └── sessions.py        # Endpoint quản lý session
 │   ├── core/
-│   │   ├── config.py          # Cấu hình (API key, đường dẫn docs...)
+│   │   ├── config.py          # Đọc & validate biến môi trường (Pydantic Settings) — chi tiết mục 12
 │   │   └── rate_limiter.py    # Middleware rate limit
 │   ├── rag/
 │   │   ├── loader.py          # Loader tuỳ chỉnh: đọc articles (Markdown) từ DB
@@ -232,6 +237,103 @@ project/
 - Cân nhắc giới hạn kích thước nội dung Markdown của mỗi bài viết để tránh reindex quá nặng.
 - Log lại toàn bộ lần reindex (`article_id` nào, category nào, thời gian, số chunk thay đổi) để dễ debug và audit.
 - Khi xoá "mềm" (soft delete, chỉ đổi `status`) thay vì xoá hẳn record, vẫn cần coi đó là sự kiện xoá khỏi vector index nếu bài viết không còn ở trạng thái `published`.
+- Vì chỉ Qwen có API embedding (DeepSeek/Groq không hỗ trợ), cần theo dõi rate limit/quota riêng của API embedding Qwen — tách biệt với quota của API chat Qwen, để tránh việc ingest hàng loạt bài viết làm ảnh hưởng tới khả năng phục vụ chat.
+- Nếu sau này đổi embedding model (ví dụ chuyển từ Qwen embedding API sang model cục bộ, hoặc đổi version embedding có dimension khác), bắt buộc **rebuild toàn bộ Qdrant collection** — nên có sẵn script/CLI command riêng cho việc này (đã liệt kê ở `/admin/reindex`), và cân nhắc dựng collection mới song song rồi chuyển traffic (blue-green) thay vì xoá collection cũ ngay lập tức.
+
+---
+
+## 12. File Cấu Hình (`.env` / `config.py`)
+
+`app/core/config.py` dùng **Pydantic Settings** (`BaseSettings`) để đọc và validate toàn bộ biến môi trường ngay lúc khởi động — app sẽ báo lỗi rõ ràng và **fail fast** nếu thiếu biến bắt buộc, thay vì lỗi mơ hồ lúc runtime khi có request đầu tiên.
+
+### 12.1. Nhóm LLM Providers
+
+| Biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `GROQ_API_KEY` | Có (nếu dùng Groq) | API key gọi model chat qua Groq |
+| `GROQ_MODEL` | Không (có default) | Tên model chat mặc định của Groq, ví dụ `llama-3.3-70b-versatile` |
+| `DEEPSEEK_API_KEY` | Tuỳ chọn | API key DeepSeek — bỏ trống nếu không dùng provider này |
+| `DEEPSEEK_MODEL` | Không | Tên model chat DeepSeek mặc định |
+| `QWEN_API_KEY` | Tuỳ chọn | API key Qwen (DashScope/Model Studio) — dùng cho cả chat lẫn embedding nếu có |
+| `QWEN_MODEL` | Không | Tên model chat Qwen mặc định |
+| `QWEN_BASE_URL` | Tuỳ chọn | Base URL endpoint tương thích OpenAI của DashScope, nếu khác default |
+| `DEFAULT_CHAT_PROVIDER` | Có | Provider dùng làm mặc định khi request không chỉ định `model` — ví dụ `groq` nếu chỉ có Groq |
+| `CHAT_FALLBACK_ORDER` | Không | Thứ tự fallback khi model chính lỗi, dạng danh sách phân tách bởi dấu phẩy, ví dụ `groq` (chỉ 1 phần tử nếu chỉ có Groq) hoặc `qwen,deepseek,groq` |
+
+### 12.2. Nhóm Embedding
+
+| Biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `EMBEDDING_PROVIDER` | Có | `qwen_api` hoặc `local` — quyết định dùng API Qwen embedding hay `sentence-transformers` cục bộ. **Nếu chỉ có Groq (không có `QWEN_API_KEY`), bắt buộc phải set giá trị này là `local`** |
+| `LOCAL_EMBEDDING_MODEL` | Có nếu `EMBEDDING_PROVIDER=local` | Tên model `sentence-transformers`, ví dụ `intfloat/multilingual-e5-base` |
+| `EMBEDDING_DIMENSION` | Có | Dimension vector — phải khớp với model đang dùng, dùng để tạo Qdrant collection đúng kích thước |
+
+### 12.3. Nhóm Database & Vector Store
+
+| Biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `DATABASE_URL` | Có | Connection string PostgreSQL/MySQL cho `categories`, `articles`, `sessions`, `messages` |
+| `QDRANT_URL` | Có | Địa chỉ Qdrant server, ví dụ `http://qdrant:6333` trong Docker Compose |
+| `QDRANT_API_KEY` | Tuỳ chọn | Chỉ cần nếu Qdrant bật xác thực (ví dụ Qdrant Cloud) |
+| `QDRANT_COLLECTION_NAME` | Có | Tên collection lưu vector knowledge base |
+| `REDIS_URL` | Có | Dùng cho rate limit và/hoặc hàng đợi đồng bộ index, ví dụ `redis://redis:6379/0` |
+
+### 12.4. Nhóm Rate Limit
+
+| Biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `RATE_LIMIT_PER_MINUTE` | Không (có default) | Số request tối đa mỗi user/IP trong 1 phút |
+| `RATE_LIMIT_TOKENS_PER_DAY` | Không | Giới hạn số token gọi LLM mỗi user mỗi ngày |
+
+### 12.5. Nhóm Ứng Dụng Chung
+
+| Biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `SITE_BASE_URL` | Có | Dùng để dựng link chi tiết bài viết: `{SITE_BASE_URL}/{category_slug}/{article_slug}` |
+| `ENV` | Không (default `production`) | `development`/`staging`/`production` — bật/tắt log chi tiết, docs Swagger, v.v. |
+| `LOG_LEVEL` | Không (default `INFO`) | Mức log cho app và sync worker |
+| `SYNC_DEBOUNCE_SECONDS` | Không (có default) | Thời gian debounce trước khi reindex một bài viết vừa thay đổi (mục 3.5) |
+
+### 12.6. Ví Dụ File `.env.example`
+
+```env
+# --- LLM Providers ---
+GROQ_API_KEY=
+GROQ_MODEL=llama-3.3-70b-versatile
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=
+QWEN_API_KEY=
+QWEN_MODEL=
+QWEN_BASE_URL=
+DEFAULT_CHAT_PROVIDER=groq
+CHAT_FALLBACK_ORDER=groq
+
+# --- Embedding ---
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+EMBEDDING_DIMENSION=768
+
+# --- Database & Vector Store ---
+DATABASE_URL=postgresql+psycopg2://user:password@postgres:5432/ragchatbot
+QDRANT_URL=http://qdrant:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION_NAME=knowledge_base
+REDIS_URL=redis://redis:6379/0
+
+# --- Rate Limit ---
+RATE_LIMIT_PER_MINUTE=20
+RATE_LIMIT_TOKENS_PER_DAY=50000
+
+# --- App ---
+SITE_BASE_URL=https://example.com
+ENV=production
+LOG_LEVEL=INFO
+SYNC_DEBOUNCE_SECONDS=2
+```
+
+Ví dụ trên là cấu hình cho **kịch bản chỉ có Groq**: `DEEPSEEK_API_KEY`/`QWEN_API_KEY` để trống, `DEFAULT_CHAT_PROVIDER` và `CHAT_FALLBACK_ORDER` chỉ có `groq`, và `EMBEDDING_PROVIDER=local` bắt buộc vì không có provider nào khác cấp API embedding.
+
+Chỉ commit `.env.example` (không chứa giá trị thật) vào git; file `.env` thật chứa secret nằm trong `.gitignore` và `.dockerignore`.
 
 ---
 
