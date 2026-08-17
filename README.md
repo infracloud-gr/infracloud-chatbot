@@ -30,6 +30,7 @@ Hệ thống chatbot hỏi-đáp dựa trên kiến trúc **RAG (Retrieval-Augme
 | Đồng bộ thay đổi dữ liệu | SQLAlchemy event hook (`after_insert`/`after_update`/`after_delete`) hoặc outbox table + background worker, kết hợp APScheduler cho polling định kỳ |
 | Quản lý version dữ liệu | `updated_at` (tín hiệu chính, DB tự cập nhật, không tốn chi phí tính toán) + `content_hash` dùng hash nhanh phi mật mã (`xxhash`/CRC32 thay vì SHA-256) làm lớp kiểm tra phụ, tính bất đồng bộ trong background |
 | Đóng gói & triển khai | Docker (multi-stage build cho app) + Docker Compose (orchestrate app, Postgres, Qdrant, Redis) |
+| CI/CD | GitHub Actions — build image và tự động đẩy lên Docker Hub dựa trên secret cấu hình trên repo GitHub |
 
 ---
 
@@ -182,6 +183,9 @@ Cơ chế **debounce** (gộp các thay đổi trong ~1-2 giây) được áp d�
 
 ```
 project/
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml  # CI/CD: build & push image lên Docker Hub
 ├── app/
 │   ├── main.py                # Khởi tạo FastAPI app
 │   ├── api/
@@ -334,6 +338,154 @@ SYNC_DEBOUNCE_SECONDS=2
 Ví dụ trên là cấu hình cho **kịch bản chỉ có Groq**: `DEEPSEEK_API_KEY`/`QWEN_API_KEY` để trống, `DEFAULT_CHAT_PROVIDER` và `CHAT_FALLBACK_ORDER` chỉ có `groq`, và `EMBEDDING_PROVIDER=local` bắt buộc vì không có provider nào khác cấp API embedding.
 
 Chỉ commit `.env.example` (không chứa giá trị thật) vào git; file `.env` thật chứa secret nằm trong `.gitignore` và `.dockerignore`.
+
+---
+
+## 13. CI/CD — GitHub Actions Đẩy Image Lên Docker Hub
+
+### 13.1. Cơ Chế Hoạt Động
+
+File `.github/workflows/docker-publish.yml` định nghĩa 2 job:
+
+- **`build-only`**: chạy khi có pull request nhắm vào `main` — chỉ build Docker image để xác nhận `Dockerfile` không lỗi, **không push** lên Docker Hub. Giúp phát hiện lỗi build sớm ngay từ PR review, trước khi merge.
+- **`build-and-push`**: chạy khi push trực tiếp vào `main` hoặc khi push git tag dạng `vX.Y.Z` — build image rồi đẩy lên Docker Hub với tag tương ứng:
+  - Push vào `main` → gắn tag `latest` + tag ngắn theo commit SHA (dễ trace lại đúng bản build).
+  - Push tag `v1.2.3` → gắn tag semver đầy đủ (`1.2.3`) và tag `major.minor` (`1.2`).
+- Dùng `docker/build-push-action` kết hợp cache qua GitHub Actions cache (`type=gha`) để các lần build sau nhanh hơn nhờ tái sử dụng layer.
+- Build đa kiến trúc (`linux/amd64,linux/arm64`) qua `docker/setup-qemu-action`, phù hợp nếu bạn deploy trên cả server x86 lẫn ARM (ví dụ AWS Graviton).
+
+Nội dung đầy đủ file `.github/workflows/docker-publish.yml`:
+
+```yaml
+name: Build and Push Docker Image
+
+# Kích hoạt khi:
+# - push lên nhánh main (build + push tag "latest")
+# - push tag dạng semver v1.2.3 (build + push tag version tương ứng)
+# - pull request nhắm vào main (chỉ build để validate, KHÔNG push)
+# - có thể chạy tay qua tab Actions (workflow_dispatch)
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  # Tên image trên Docker Hub, dạng <docker_hub_username>/<repo_name>
+  # DOCKERHUB_USERNAME lấy từ GitHub Secrets, DOCKERHUB_REPO có thể set cứng hoặc cũng để trong Secrets/Variables
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPO || 'rag-chatbot' }}
+
+jobs:
+  # Job build-only: chạy cho pull request, chỉ để đảm bảo Dockerfile build được, KHÔNG đẩy lên Docker Hub
+  build-only:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job build-and-push: chạy khi push vào main hoặc push tag semver, đẩy image lên Docker Hub
+  build-and-push:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (hỗ trợ build đa kiến trúc)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Tự động sinh tag cho image dựa trên sự kiện trigger:
+      # - nhánh main -> tag "latest"
+      # - commit sha  -> tag ngắn theo sha (dễ trace lại đúng bản build)
+      # - git tag vX.Y.Z -> tag semver đầy đủ + tag major.minor
+      - name: Extract Docker metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description (tuỳ chọn)
+        if: github.ref == 'refs/heads/main'
+        uses: peter-evans/dockerhub-description@v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          readme-filepath: ./README.md
+```
+
+### 13.2. Secrets Cần Cấu Hình Trên GitHub Repository
+
+Vào **Settings → Secrets and variables → Actions** của repo GitHub, khai báo:
+
+| Tên Secret/Variable | Loại | Bắt buộc | Mô tả |
+|---|---|---|---|
+| `DOCKERHUB_USERNAME` | Secret | Có | Username tài khoản Docker Hub của bạn |
+| `DOCKERHUB_TOKEN` | Secret | Có | **Access Token** tạo từ Docker Hub (Account Settings → Security → New Access Token) — **không dùng mật khẩu tài khoản trực tiếp** vì kém an toàn hơn và không thu hồi được riêng lẻ |
+| `DOCKERHUB_REPO` | Variable (không phải Secret, vì không nhạy cảm) | Không (có default `rag-chatbot` trong workflow) | Tên repository trên Docker Hub, ví dụ `rag-chatbot` — image cuối sẽ có dạng `{DOCKERHUB_USERNAME}/{DOCKERHUB_REPO}` |
+
+Lưu ý phân biệt: GitHub Actions có 2 khái niệm riêng — **Secrets** (giá trị mã hoá, không hiện lại được sau khi lưu, dùng cho token/password) và **Variables** (giá trị plain-text, xem lại được, dùng cho cấu hình không nhạy cảm như tên repo). `DOCKERHUB_REPO` nên để dạng Variable vì không phải thông tin nhạy cảm.
+
+### 13.3. Các Bước Thiết Lập Trên Docker Hub
+
+1. Đăng nhập Docker Hub → **Account Settings → Security → New Access Token**, đặt quyền **Read & Write**, copy token này để dán vào `DOCKERHUB_TOKEN` trên GitHub (token chỉ hiện 1 lần lúc tạo).
+2. Tạo trước repository trên Docker Hub (public hoặc private tuỳ nhu cầu) với tên khớp với `DOCKERHUB_REPO`, hoặc để workflow tự tạo repository mới khi push lần đầu (Docker Hub cho phép tạo repo qua lần push đầu tiên nếu tài khoản có quyền).
+
+### 13.4. Quy Trình Release Đề Xuất
+
+1. Merge code vào `main` → tự động build + push tag `latest` (dùng cho môi trường staging/luôn cập nhật mới nhất).
+2. Khi sẵn sàng release chính thức, tạo git tag theo semver và push tag đó:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+3. Workflow tự động build + push image với tag `1.0.0` và `1.0` lên Docker Hub — dùng tag cố định này cho `docker-compose.yml` ở môi trường production, thay vì `latest`, để đảm bảo mỗi lần deploy là một phiên bản xác định, có thể rollback dễ dàng bằng cách trỏ lại tag cũ.
 
 ---
 
