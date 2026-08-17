@@ -32,8 +32,6 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   build-and-push:
     if: github.event_name != 'pull_request'
