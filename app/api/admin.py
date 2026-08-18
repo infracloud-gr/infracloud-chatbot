@@ -29,3 +29,22 @@ def index_status(db: Session = Depends(get_db)):
         "published_articles": articles_count,
         "categories": categories_count,
     }
+
+def get_rag_service():
+    from app.main import rag_service
+    return rag_service
+
+@router.get("/llm-health")
+def llm_health(rag = Depends(get_rag_service)):
+    from langchain_core.messages import HumanMessage
+    models = rag.router.resolve_chain()
+    results = {}
+    for llm, provider in models:
+        try:
+            llm.invoke([HumanMessage(content="Hello, this is a health check. Please reply 'OK'.")])
+            results[provider] = "ok"
+        except Exception as e:
+            results[provider] = f"error: {str(e)}"
+    
+    overall_status = "ok" if any(v == "ok" for v in results.values()) else "error"
+    return {"status": overall_status, "providers": results}
