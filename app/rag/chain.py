@@ -1,3 +1,4 @@
+import logging
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -6,6 +7,7 @@ from app.llm.router import LLMRouter
 from app.rag.source_links import build_source
 from app.rag.vectorstore import VectorStoreService
 
+logger = logging.getLogger(__name__)
 
 class RAGService:
     def __init__(self, settings: Settings):
@@ -36,13 +38,30 @@ class RAGService:
     def ask(self, question: str, history: list[dict], requested_model: str | None = None) -> dict:
         docs = self.retrieve(question)
         context = "\n\n".join(doc.page_content for doc in docs)
-        llm, provider = self.router.resolve_chain(requested_model)
+        
+        models = self.router.resolve_chain(requested_model)
         messages = self.prompt.format_messages(
             history=self._format_history(history),
             context=context,
             question=question,
         )
-        answer = llm.invoke(messages).content
+        
+        answer = None
+        used_provider = None
+        last_error = None
+        
+        for llm, provider in models:
+            try:
+                answer = llm.invoke(messages).content
+                used_provider = provider
+                break
+            except Exception as e:
+                logger.warning("Provider %s failed with error: %s", provider, e)
+                last_error = e
+                continue
+                
+        if answer is None:
+            raise RuntimeError(f"All chat providers failed. Last error: {last_error}")
 
         deduplicated: dict[int, dict] = {}
         for doc in docs:
@@ -51,6 +70,6 @@ class RAGService:
 
         return {
             "answer": answer,
-            "model_used": provider,
+            "model_used": used_provider,
             "sources": list(deduplicated.values()),
         }

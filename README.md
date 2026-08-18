@@ -132,7 +132,7 @@ Cơ chế **debounce** (gộp các thay đổi trong ~1-2 giây) được áp d�
 - Xây dựng lớp **Model Router** — áp dụng cho bước **sinh câu trả lời (chat/completion)**, không áp dụng cho embedding (embedding dùng riêng API Qwen embedding, xem mục 3.4):
   - Cấu hình model mặc định.
   - Cho phép người dùng chọn model qua tham số request (`model: "deepseek" | "groq" | "qwen"`).
-  - Cơ chế **fallback**: nếu model chính lỗi (timeout, rate limit từ phía provider), tự động chuyển sang model dự phòng theo danh sách ưu tiên (dùng `RunnableWithFallbacks` của LangChain).
+  - Cơ chế **fallback**: nếu model chính lỗi (timeout, rate limit từ phía provider), tự động chuyển sang model dự phòng theo danh sách ưu tiên. Hệ thống sử dụng vòng lặp xử lý lỗi (manual fallback loop) thay vì `RunnableWithFallbacks` của LangChain để đảm bảo ghi nhận chính xác tên provider đã xử lý thành công (model_used) và lưu vào lịch sử.
 - RAG chain dùng chung 1 prompt template cho mọi model, đảm bảo tính nhất quán câu trả lời dù chọn model nào.
 
 ---

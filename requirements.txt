@@ -13,6 +13,7 @@ langchain-community==0.3.27
 langchain-openai==0.3.30
 langchain-groq==0.3.7
 langchain-qdrant==0.2.0
-qdrant-client==1.15.1
+qdrant-client==1.19.0
+langchain-huggingface==0.1.2
 sentence-transformers==5.1.0
 psycopg2-binary==2.9.10

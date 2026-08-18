@@ -36,17 +36,20 @@ class LLMRouter:
             )
         raise ValueError(f"Unsupported provider: {provider}")
 
-    def resolve_chain(self, requested_model: str | None = None) -> tuple[BaseChatModel, str]:
+    def resolve_chain(self, requested_model: str | None = None) -> list[tuple[BaseChatModel, str]]:
         fallback_order: Iterable[str] = [requested_model] if requested_model else [self.settings.default_chat_provider]
         fallback_order = list(dict.fromkeys([*fallback_order, *self.settings.fallback_providers]))
 
-        last_error: Exception | None = None
+        models: list[tuple[BaseChatModel, str]] = []
         for provider in fallback_order:
             if not provider:
                 continue
             try:
-                return self._build_model(provider), provider
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
+                models.append((self._build_model(provider), provider))
+            except Exception:
                 continue
-        raise RuntimeError(f"No chat provider is available. Last error: {last_error}")
+        
+        if not models:
+            raise RuntimeError("No chat provider is available due to missing configuration.")
+        
+        return models

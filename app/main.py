@@ -23,7 +23,17 @@ app.include_router(sessions.router)
 app.include_router(admin.router)
 
 rag_service = RAGService(settings)
+from sqlalchemy import event
+from app.content.models import Article
+
 sync_manager = SyncManager(VectorStoreService(settings), debounce_seconds=settings.sync_debounce_seconds)
+
+def _on_article_change(mapper, connection, target):
+    sync_manager.mark_article_changed(target.article_id, "changed")
+
+event.listen(Article, "after_insert", _on_article_change)
+event.listen(Article, "after_update", _on_article_change)
+event.listen(Article, "after_delete", _on_article_change)
 
 
 @app.on_event("startup")

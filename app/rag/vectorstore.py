@@ -1,6 +1,6 @@
 import uuid
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -12,7 +12,8 @@ from app.core.config import Settings
 class VectorStoreService:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+        api_key = settings.qdrant_api_key if settings.qdrant_api_key else None
+        self.client = QdrantClient(url=settings.qdrant_url, api_key=api_key)
         self.embeddings = self._build_embeddings()
 
     def _build_embeddings(self):
